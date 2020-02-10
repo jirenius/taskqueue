@@ -1,4 +1,4 @@
-# Key Lock for Go
+# Task Queues for Go
 
 [![License MIT](https://img.shields.io/badge/License-MIT-blue.svg)](http://opensource.org/licenses/MIT)
 [![Report Card](http://goreportcard.com/badge/github.com/jirenius/taskqueue)](http://goreportcard.com/report/jirenius/taskqueue)
