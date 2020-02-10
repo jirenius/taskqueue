@@ -6,7 +6,8 @@ import (
 	"github.com/jirenius/taskqueue"
 )
 
-func Example() {
+// ExampleTaskQueue demonstrates how to enqueue callbacks.
+func Example_taskQueue() {
 	ch := make(chan string)
 	// Create TaskQueue with a queue cap of 5.
 	tq := taskqueue.NewTaskQueue(5)
