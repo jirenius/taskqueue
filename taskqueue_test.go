@@ -42,6 +42,35 @@ func TestTaskQueueTryDo_Serial_CalledInOrder(t *testing.T) {
 	v.Validate("abc")
 }
 
+func TestTaskQueueFlush_Single_FlushesQueue(t *testing.T) {
+	v := validator{t: t}
+	tq := NewTaskQueue(4)
+	v.Add(3)
+	tq.Do(func() { v.Done("a") })
+	tq.Do(func() { v.Done("b") })
+	tq.Do(func() { v.Done("c") })
+	tq.Flush()
+	v.Is("abc")
+	v.WaitTimeout()
+}
+
+func TestTaskQueueFlush_Multiple_FlushesQueue(t *testing.T) {
+	v := validator{t: t}
+	tq := NewTaskQueue(3)
+	v.Add(3 + 5)
+	tq.Do(func() { v.Done("a") })
+	tq.Do(func() { v.Done("b") })
+	tq.Do(func() { v.Done("c") })
+	for i := 0; i < 5; i++ {
+		go func() {
+			tq.Flush()
+			v.Is("abc")
+			v.Done("")
+		}()
+	}
+	v.Validate("abc")
+}
+
 // validator embeds a waitgroup, and validates that the order
 // Done is called is correct.
 type validator struct {
@@ -55,27 +84,29 @@ func (v *validator) Done(a string) {
 	v.WaitGroup.Done()
 }
 
-// waitTimeout waits for the waitgroup for the specified max timeout.
+// WaitTimeout waits for the waitgroup for the specified max timeout.
 // Returns true if waiting timed out.
-func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+func (v *validator) WaitTimeout() {
 	c := make(chan struct{})
 	go func() {
 		defer close(c)
-		wg.Wait()
+		v.Wait()
 	}()
 	select {
 	case <-c:
-		return false // completed normally
-	case <-time.After(timeout):
-		return true // timed out
+	case <-time.After(time.Second):
+		v.t.Fatalf("Timed out")
 	}
 }
 
 func (v *validator) Validate(expected string) {
-	if waitTimeout(&v.WaitGroup, time.Second) {
-		v.t.Errorf("Timed out")
-		return
+	v.WaitTimeout()
+	if expected != v.s {
+		v.t.Errorf("Expected %#v, but got %#v", expected, v.s)
 	}
+}
+
+func (v *validator) Is(expected string) {
 	if expected != v.s {
 		v.t.Errorf("Expected %#v, but got %#v", expected, v.s)
 	}

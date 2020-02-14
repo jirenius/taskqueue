@@ -11,6 +11,7 @@ type TaskQueue struct {
 	working bool
 	offset  int
 	size    int
+	flush   *sync.Cond
 }
 
 // NewTaskQueue returns a new TaskQueue.
@@ -23,9 +24,10 @@ func NewTaskQueue(cap int) *TaskQueue {
 	}
 	l := sync.Mutex{}
 	return &TaskQueue{
-		c:   sync.NewCond(&l),
-		q:   make([]func(), cap),
-		cap: cap,
+		c:     sync.NewCond(&l),
+		q:     make([]func(), cap),
+		cap:   cap,
+		flush: sync.NewCond(&l),
 	}
 }
 
@@ -52,6 +54,16 @@ func (tq *TaskQueue) TryDo(task func()) bool {
 	}
 	tq.addTask(task)
 	return true
+}
+
+// Flush waits for the queue to be cleared.
+func (tq *TaskQueue) Flush() {
+	tq.flush.L.Lock()
+	// Wait until the queue is empty
+	for tq.size > 0 {
+		tq.flush.Wait()
+	}
+	tq.flush.L.Unlock()
 }
 
 func (tq *TaskQueue) addTask(task func()) {
@@ -83,5 +95,6 @@ func (tq *TaskQueue) processQueue() {
 		tq.c.L.Lock()
 	}
 	tq.working = false
+	tq.flush.Broadcast()
 	tq.c.L.Unlock()
 }
