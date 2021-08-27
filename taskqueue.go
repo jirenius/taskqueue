@@ -9,9 +9,12 @@ type TaskQueue struct {
 	q       []func()
 	cap     int
 	working bool
+	intask  bool
 	offset  int
 	size    int
 	flush   *sync.Cond
+	pauses  int
+	pause   *sync.Cond
 }
 
 // NewTaskQueue returns a new TaskQueue.
@@ -28,6 +31,7 @@ func NewTaskQueue(cap int) *TaskQueue {
 		q:     make([]func(), cap),
 		cap:   cap,
 		flush: sync.NewCond(&l),
+		pause: sync.NewCond(&l),
 	}
 }
 
@@ -66,6 +70,31 @@ func (tq *TaskQueue) Flush() {
 	tq.flush.L.Unlock()
 }
 
+// Pause stops handling new tasks, and waits until any currently running task is complete. If Pause is called multiple times, an equal
+// number of calls to Resume must be made to resume handling of tasks.
+func (tq *TaskQueue) Pause() {
+	tq.pause.L.Lock()
+	defer tq.pause.L.Unlock()
+	tq.pauses++
+	// If a task is being handled, wait until it is done, or Resume is called.
+	for tq.intask {
+		tq.pause.Wait()
+	}
+}
+
+// Resume starts task handling again after being paused by calling Pause.
+func (tq *TaskQueue) Resume() {
+	tq.pause.L.Lock()
+	defer tq.pause.L.Unlock()
+	if tq.pauses == 0 {
+		panic("taskqueue is not paused")
+	}
+	tq.pauses--
+	if tq.pauses == 0 {
+		tq.pause.Broadcast()
+	}
+}
+
 func (tq *TaskQueue) addTask(task func()) {
 	// If we don't have a worker goroutine, we start one.
 	if !tq.working {
@@ -89,10 +118,18 @@ func (tq *TaskQueue) processQueue() {
 			tq.c.Signal()
 		}
 		tq.size--
+		// Check if paused
+		for tq.pauses > 0 {
+			tq.pause.Wait()
+		}
+		tq.intask = true
 		tq.c.L.Unlock()
 		// Perform task
 		task()
 		tq.c.L.Lock()
+		tq.intask = false
+		// Broadcast to all calls to Pause to continue
+		tq.pause.Broadcast()
 	}
 	tq.working = false
 	tq.flush.Broadcast()

@@ -71,6 +71,54 @@ func TestTaskQueueFlush_Multiple_FlushesQueue(t *testing.T) {
 	v.Validate("abc")
 }
 
+func TestTaskQueuePause_OnEmpty_WaitsUntilResume(t *testing.T) {
+	v := validator{t: t}
+	tq := NewTaskQueue(5)
+	tq.Pause()
+	v.Add(3)
+	tq.Do(func() { v.Done("a") })
+	tq.Do(func() { v.Done("b") })
+	tq.Do(func() { v.Done("c") })
+	v.ValidateNotDone("")
+	tq.Resume()
+	v.Validate("abc")
+}
+
+func TestTaskQueuePause_CalledTwice_WaitsUntilResumeCalledTwice(t *testing.T) {
+	v := validator{t: t}
+	tq := NewTaskQueue(5)
+	tq.Pause()
+	tq.Pause()
+	v.Add(3)
+	tq.Do(func() { v.Done("a") })
+	tq.Do(func() { v.Done("b") })
+	tq.Do(func() { v.Done("c") })
+	tq.Resume()
+	v.ValidateNotDone("")
+	tq.Resume()
+	v.Validate("abc")
+}
+
+func TestTaskQueuePause_DuringTask_WaitsUntilResume(t *testing.T) {
+	v := validator{t: t}
+	tq := NewTaskQueue(5)
+	v.Add(3)
+	tq.Do(func() {
+		v.Done("a")
+		pause := make(chan bool)
+		go func() {
+			go func() { pause <- true }()
+			tq.Pause()
+			v.Done("b")
+		}()
+		<-pause
+	})
+	tq.Do(func() { v.Done("c") })
+	v.ValidateNotDone("ab")
+	tq.Resume()
+	v.Validate("abc")
+}
+
 // validator embeds a waitgroup, and validates that the order
 // Done is called is correct.
 type validator struct {
@@ -103,6 +151,22 @@ func (v *validator) Validate(expected string) {
 	v.WaitTimeout()
 	if expected != v.s {
 		v.t.Errorf("Expected %#v, but got %#v", expected, v.s)
+	}
+}
+
+func (v *validator) ValidateNotDone(expected string) {
+	c := make(chan struct{})
+	go func() {
+		defer close(c)
+		v.Wait()
+	}()
+	select {
+	case <-c:
+		v.t.Fatalf("Is unexpectedly done")
+	case <-time.After(time.Millisecond):
+		if expected != v.s {
+			v.t.Errorf("Expected %#v, but got %#v", expected, v.s)
+		}
 	}
 }
 
