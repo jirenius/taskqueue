@@ -3,135 +3,218 @@ package taskqueue
 import "sync"
 
 // TaskQueue implements a queue for tasks to be handled sequentially in
-// a first-in-first-out order on a separate goroutine.
+// first-in-first-out order on a separate goroutine.
+//
+// A task may call TryDo. It may call Do only when it can establish that space
+// is available; Do waiting for a full queue would prevent this single worker
+// from freeing space. A task must not call Pause or Flush: both operations wait
+// for the currently running task to return, so calling either from that task
+// would wait for itself forever. Go does not provide a safe goroutine identity
+// with which to distinguish those cases from ordinary concurrent callers. A
+// task can use RequestPause and FlushAsync instead.
+//
+// Panics from tasks are recovered so that later queued tasks continue to run.
+// TaskQueueOptions.OnPanic can observe the recovered value. This also applies
+// to a nil task, which panics when invoked.
 type TaskQueue struct {
-	c       *sync.Cond
+	mu sync.Mutex
+
+	// notFull is waited on only while size == cap. Its predicate is protected
+	// by mu. state is waited on while a pause or flush predicate is false; its
+	// predicates (size, active, and pauses) are also protected by mu.
+	notFull *sync.Cond
+	state   *sync.Cond
+
 	q       []func()
-	cap     int
-	working bool
-	intask  bool
-	offset  int
+	head    int
 	size    int
-	flush   *sync.Cond
+	cap     int
+	worker  bool
+	active  bool
 	pauses  int
-	pause   *sync.Cond
+	onPanic func(interface{})
+}
+
+// TaskQueueOptions configures a TaskQueue.
+type TaskQueueOptions struct {
+	// OnPanic is called asynchronously for each recovered task panic. A panic
+	// in the handler is recovered and ignored so it cannot stop the queue.
+	OnPanic func(interface{})
 }
 
 // NewTaskQueue returns a new TaskQueue.
 //
-// The value cap is the number of tasks that may be queue at the same time,
-// and must be 1 or greater.
+// The value cap is the number of waiting tasks that may be queued at the same
+// time, and must be 1 or greater.
 func NewTaskQueue(cap int) *TaskQueue {
+	return NewTaskQueueWithOptions(cap, TaskQueueOptions{})
+}
+
+// NewTaskQueueWithOptions returns a new TaskQueue configured with options.
+func NewTaskQueueWithOptions(cap int, options TaskQueueOptions) *TaskQueue {
 	if cap < 1 {
 		panic("cap must be 1 or greater")
 	}
-	l := sync.Mutex{}
-	return &TaskQueue{
-		c:     sync.NewCond(&l),
-		q:     make([]func(), cap),
-		cap:   cap,
-		flush: sync.NewCond(&l),
-		pause: sync.NewCond(&l),
+	tq := &TaskQueue{
+		q:       make([]func(), cap),
+		cap:     cap,
+		onPanic: options.OnPanic,
 	}
+	tq.notFull = sync.NewCond(&tq.mu)
+	tq.state = sync.NewCond(&tq.mu)
+	return tq
 }
 
-// Do will enqueue the task to be handled by the task queue.
-// If the queue is full, Do will wait block until there is room in the queue.
+// Do enqueues task to be handled by the task queue. If the queue is full, Do
+// blocks until there is room in the waiting queue.
 func (tq *TaskQueue) Do(task func()) {
-	tq.c.L.Lock()
-	// Wait until there is room in the queue
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
 	for tq.size == tq.cap {
-		tq.c.Wait()
+		tq.notFull.Wait()
 	}
-	tq.addTask(task)
-	tq.c.L.Unlock()
+	tq.addTaskLocked(task)
 }
 
-// TryDo will try to enqueue the task and return true on success.
-// It will return false if the work queue is full.
+// TryDo tries to enqueue task and returns true on success. It returns false if
+// the waiting queue is full.
 func (tq *TaskQueue) TryDo(task func()) bool {
-	tq.c.L.Lock()
-	defer tq.c.L.Unlock()
-	// Check if there is room in the queue
-	for tq.size == tq.cap {
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
+	if tq.size == tq.cap {
 		return false
 	}
-	tq.addTask(task)
+	tq.addTaskLocked(task)
 	return true
 }
 
-// Flush waits for the queue to be cleared.
+// Flush waits until there are no waiting tasks and no task is executing. Work
+// submitted after Flush has observed that state is not covered by the barrier.
+// Flush must not be called by a task running on this queue; see TaskQueue.
 func (tq *TaskQueue) Flush() {
-	tq.flush.L.Lock()
-	// Wait until the queue is empty
-	for tq.size > 0 {
-		tq.flush.Wait()
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
+	for tq.size != 0 || tq.active {
+		tq.state.Wait()
 	}
-	tq.flush.L.Unlock()
 }
 
-// Pause stops handling new tasks, and waits until any currently running task is complete. If Pause is called multiple times, an equal
-// number of calls to Resume must be made to resume handling of tasks.
+// Pause prevents new tasks from starting and waits for a currently executing
+// task to finish. Calls nest: each successful Pause requires one Resume before
+// processing continues. Pause must not be called by a task running on this
+// queue; see TaskQueue.
 func (tq *TaskQueue) Pause() {
-	tq.pause.L.Lock()
-	defer tq.pause.L.Unlock()
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
 	tq.pauses++
-	// If a task is being handled, wait until it is done, or Resume is called.
-	for tq.intask {
-		tq.pause.Wait()
+	for tq.active {
+		tq.state.Wait()
 	}
 }
 
-// Resume starts task handling again after being paused by calling Pause.
+// RequestPause prevents new tasks from starting without waiting for a task that
+// is already executing. It otherwise nests exactly like Pause, and each call
+// requires one Resume. It is safe to call from a task running on this queue.
+func (tq *TaskQueue) RequestPause() {
+	tq.mu.Lock()
+	tq.pauses++
+	tq.mu.Unlock()
+}
+
+// Resume starts task handling again after matching calls to Pause or
+// RequestPause.
 func (tq *TaskQueue) Resume() {
-	tq.pause.L.Lock()
-	defer tq.pause.L.Unlock()
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
 	if tq.pauses == 0 {
 		panic("taskqueue is not paused")
 	}
 	tq.pauses--
 	if tq.pauses == 0 {
-		tq.pause.Broadcast()
+		tq.state.Broadcast()
 	}
 }
 
-func (tq *TaskQueue) addTask(task func()) {
-	// If we don't have a worker goroutine, we start one.
-	if !tq.working {
-		tq.working = true
+// FlushAsync returns a channel that is closed when Flush's completion condition
+// is met. It is safe to call from a task running on this queue; that task must
+// not wait for the returned channel before returning.
+func (tq *TaskQueue) FlushAsync() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		tq.Flush()
+		close(done)
+	}()
+	return done
+}
+
+// addTaskLocked adds a task and starts a worker if needed. mu must be held.
+func (tq *TaskQueue) addTaskLocked(task func()) {
+	tq.q[(tq.head+tq.size)%tq.cap] = task
+	tq.size++
+	if !tq.worker {
+		tq.worker = true
 		go tq.processQueue()
 	}
-	// Add task to queue
-	tq.q[(tq.offset+tq.size)%tq.cap] = task
-	tq.size++
 }
 
 func (tq *TaskQueue) processQueue() {
-	tq.c.L.Lock()
-	for tq.size > 0 {
-		// Get next task
-		task := tq.q[tq.offset]
-		tq.q[tq.offset] = nil // Prevent memory leaks
-		tq.offset = (tq.offset + 1) % tq.cap
-		// If queue was full, signal that one slot is now free.
-		if tq.size == tq.cap {
-			tq.c.Signal()
+	// This defer also covers runtime.Goexit in a task. invokeTask clears active
+	// first; if work remains, starting a replacement worker keeps it live.
+	defer tq.workerStopped()
+
+	for {
+		tq.mu.Lock()
+		for tq.pauses > 0 && tq.size > 0 {
+			tq.state.Wait()
 		}
+		if tq.size == 0 {
+			tq.mu.Unlock()
+			return
+		}
+
+		task := tq.q[tq.head]
+		tq.q[tq.head] = nil // Do not retain completed tasks.
+		tq.head = (tq.head + 1) % tq.cap
 		tq.size--
-		// Check if paused
-		for tq.pauses > 0 {
-			tq.pause.Wait()
-		}
-		tq.intask = true
-		tq.c.L.Unlock()
-		// Perform task
-		task()
-		tq.c.L.Lock()
-		tq.intask = false
-		// Broadcast to all calls to Pause to continue
-		tq.pause.Broadcast()
+		tq.active = true
+		tq.notFull.Signal()
+		tq.mu.Unlock()
+
+		tq.invokeTask(task)
 	}
-	tq.working = false
-	tq.flush.Broadcast()
-	tq.c.L.Unlock()
+}
+
+func (tq *TaskQueue) invokeTask(task func()) {
+	defer func() {
+		// A task panic must not terminate the worker or leave active set. Goexit
+		// has a nil recover value, but this deferred cleanup still runs.
+		panicValue := recover()
+		tq.mu.Lock()
+		tq.active = false
+		tq.state.Broadcast()
+		tq.mu.Unlock()
+		if panicValue != nil && tq.onPanic != nil {
+			go callPanicHandler(tq.onPanic, panicValue)
+		}
+	}()
+	task()
+}
+
+func callPanicHandler(handler func(interface{}), panicValue interface{}) {
+	defer func() { _ = recover() }()
+	handler(panicValue)
+}
+
+func (tq *TaskQueue) workerStopped() {
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
+	tq.worker = false
+	if tq.size > 0 {
+		// A producer can enqueue between the worker's empty check and this
+		// deferred cleanup; runtime.Goexit in a task reaches this path too.
+		// Keep the queue live in both cases.
+		tq.worker = true
+		go tq.processQueue()
+	}
+	tq.state.Broadcast()
 }
