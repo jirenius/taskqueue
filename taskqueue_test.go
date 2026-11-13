@@ -123,12 +123,15 @@ func TestTaskQueuePause_DuringTask_WaitsUntilResume(t *testing.T) {
 // Done is called is correct.
 type validator struct {
 	sync.WaitGroup
-	t *testing.T
-	s string
+	t  *testing.T
+	mu sync.Mutex
+	s  string
 }
 
 func (v *validator) Done(a string) {
+	v.mu.Lock()
 	v.s += a
+	v.mu.Unlock()
 	v.WaitGroup.Done()
 }
 
@@ -149,6 +152,8 @@ func (v *validator) WaitTimeout() {
 
 func (v *validator) Validate(expected string) {
 	v.WaitTimeout()
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if expected != v.s {
 		v.t.Errorf("Expected %#v, but got %#v", expected, v.s)
 	}
@@ -164,6 +169,8 @@ func (v *validator) ValidateNotDone(expected string) {
 	case <-c:
 		v.t.Fatalf("Is unexpectedly done")
 	case <-time.After(time.Millisecond):
+		v.mu.Lock()
+		defer v.mu.Unlock()
 		if expected != v.s {
 			v.t.Errorf("Expected %#v, but got %#v", expected, v.s)
 		}
@@ -171,6 +178,8 @@ func (v *validator) ValidateNotDone(expected string) {
 }
 
 func (v *validator) Is(expected string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if expected != v.s {
 		v.t.Errorf("Expected %#v, but got %#v", expected, v.s)
 	}

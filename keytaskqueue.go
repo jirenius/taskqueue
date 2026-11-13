@@ -4,11 +4,22 @@ import "sync"
 
 // KeyTaskQueue implements a queue for tasks to be handled sequentially in
 // a first-in-first-out order on separate goroutines identified by a key string.
+// Panics from tasks are recovered so that later work for the same key continues.
+// A task may call TryDo, but must not call Do if its key's waiting queue is
+// full, because it would block the only worker that can free capacity.
 type KeyTaskQueue struct {
-	mu    sync.Mutex
-	qpool sync.Pool
-	qs    map[string]*taskQueue
-	cap   int
+	mu      sync.Mutex
+	qpool   sync.Pool
+	qs      map[string]*taskQueue
+	cap     int
+	onPanic func(interface{})
+}
+
+// KeyTaskQueueOptions configures a KeyTaskQueue.
+type KeyTaskQueueOptions struct {
+	// OnPanic is called asynchronously for each recovered task panic. A panic
+	// in the handler is recovered and ignored so it cannot stop the queue.
+	OnPanic func(interface{})
 }
 
 type taskQueue struct {
@@ -23,12 +34,18 @@ type taskQueue struct {
 // The value cap is the number of tasks that may be queue at the same time,
 // and must be 1 or greater.
 func NewKeyTaskQueue(cap int) *KeyTaskQueue {
+	return NewKeyTaskQueueWithOptions(cap, KeyTaskQueueOptions{})
+}
+
+// NewKeyTaskQueueWithOptions returns a new KeyTaskQueue configured with options.
+func NewKeyTaskQueueWithOptions(cap int, options KeyTaskQueueOptions) *KeyTaskQueue {
 	if cap < 1 {
 		panic("cap must be 1 or greater")
 	}
 	nq := &KeyTaskQueue{
-		qs:  make(map[string]*taskQueue),
-		cap: cap,
+		qs:      make(map[string]*taskQueue),
+		cap:     cap,
+		onPanic: options.OnPanic,
 	}
 	nq.qpool.New = nq.newQueue
 	return nq
@@ -93,8 +110,13 @@ func (nq *KeyTaskQueue) addTask(q *taskQueue, task func()) {
 }
 
 func (nq *KeyTaskQueue) processQueue(key string, q *taskQueue) {
-	nq.mu.Lock()
-	for q.size > 0 {
+	defer nq.workerStopped(key, q)
+	for {
+		nq.mu.Lock()
+		if q.size == 0 {
+			nq.mu.Unlock()
+			return
+		}
 		// Get next task
 		task := q.q[q.offset]
 		q.q[q.offset] = nil // Prevent memory leaks
@@ -106,10 +128,29 @@ func (nq *KeyTaskQueue) processQueue(key string, q *taskQueue) {
 		q.size--
 		nq.mu.Unlock()
 		// Perform task
-		task()
-		nq.mu.Lock()
+		nq.invokeTask(task)
+	}
+}
+
+// invokeTask keeps a task panic from stranding later work for the same key.
+func (nq *KeyTaskQueue) invokeTask(task func()) {
+	defer func() {
+		if panicValue := recover(); panicValue != nil && nq.onPanic != nil {
+			go callPanicHandler(nq.onPanic, panicValue)
+		}
+	}()
+	task()
+}
+
+func (nq *KeyTaskQueue) workerStopped(key string, q *taskQueue) {
+	nq.mu.Lock()
+	defer nq.mu.Unlock()
+	if q.size > 0 {
+		// A producer can enqueue while the worker is shutting down; runtime.Goexit
+		// in a task reaches this path too. Continue the key's work in either case.
+		go nq.processQueue(key, q)
+		return
 	}
 	delete(nq.qs, key)
 	nq.qpool.Put(q)
-	nq.mu.Unlock()
 }
