@@ -42,13 +42,17 @@ itself to return and would therefore deadlock. Callbacks can instead use
 `RequestPause` and `FlushAsync` (without waiting for the returned channel before
 the callback returns).
 
+To observe recovered panics, construct the queue with `TaskQueueOptions` and
+an `OnPanic` callback. The callback runs asynchronously; its own panic is
+recovered and ignored.
+
 ### KeyTaskQueue
 ```go
     // Create a KeyTaskQueue with a queue cap of 5 per key.
     ktq := taskqueue.NewKeyTaskQueue(5)
 
     // Add callbacks to be called sequentially, on different
-	// goroutines for each key, in the queued order.
+    // goroutines for each key, in the queued order.
     ktq.Do("foo", func() { fmt.Println("First foo") })
     ktq.Do("foo", func() { fmt.Println("Second foo") })
     ktq.Do("bar", func() { fmt.Println("First bar") })
@@ -61,4 +65,5 @@ the callback returns).
 
 Keyed queues also recover task panics and continue the remaining work for that
 key. As with `TaskQueue`, a callback should use `TryDo` rather than call `Do`
-when its key's waiting queue might be full.
+when its key's waiting queue might be full. Use `KeyTaskQueueOptions.OnPanic`
+with `NewKeyTaskQueueWithOptions` to observe recovered panics.

@@ -13,8 +13,9 @@ import "sync"
 // with which to distinguish those cases from ordinary concurrent callers. A
 // task can use RequestPause and FlushAsync instead.
 //
-// Panics from tasks are recovered and discarded so that later queued tasks
-// continue to run. This also applies to a nil task, which panics when invoked.
+// Panics from tasks are recovered so that later queued tasks continue to run.
+// TaskQueueOptions.OnPanic can observe the recovered value. This also applies
+// to a nil task, which panics when invoked.
 type TaskQueue struct {
 	mu sync.Mutex
 
@@ -24,13 +25,21 @@ type TaskQueue struct {
 	notFull *sync.Cond
 	state   *sync.Cond
 
-	q      []func()
-	head   int
-	size   int
-	cap    int
-	worker bool
-	active bool
-	pauses int
+	q       []func()
+	head    int
+	size    int
+	cap     int
+	worker  bool
+	active  bool
+	pauses  int
+	onPanic func(interface{})
+}
+
+// TaskQueueOptions configures a TaskQueue.
+type TaskQueueOptions struct {
+	// OnPanic is called asynchronously for each recovered task panic. A panic
+	// in the handler is recovered and ignored so it cannot stop the queue.
+	OnPanic func(interface{})
 }
 
 // NewTaskQueue returns a new TaskQueue.
@@ -38,12 +47,18 @@ type TaskQueue struct {
 // The value cap is the number of waiting tasks that may be queued at the same
 // time, and must be 1 or greater.
 func NewTaskQueue(cap int) *TaskQueue {
+	return NewTaskQueueWithOptions(cap, TaskQueueOptions{})
+}
+
+// NewTaskQueueWithOptions returns a new TaskQueue configured with options.
+func NewTaskQueueWithOptions(cap int, options TaskQueueOptions) *TaskQueue {
 	if cap < 1 {
 		panic("cap must be 1 or greater")
 	}
 	tq := &TaskQueue{
-		q:   make([]func(), cap),
-		cap: cap,
+		q:       make([]func(), cap),
+		cap:     cap,
+		onPanic: options.OnPanic,
 	}
 	tq.notFull = sync.NewCond(&tq.mu)
 	tq.state = sync.NewCond(&tq.mu)
@@ -173,13 +188,21 @@ func (tq *TaskQueue) invokeTask(task func()) {
 	defer func() {
 		// A task panic must not terminate the worker or leave active set. Goexit
 		// has a nil recover value, but this deferred cleanup still runs.
-		_ = recover()
+		panicValue := recover()
 		tq.mu.Lock()
 		tq.active = false
 		tq.state.Broadcast()
 		tq.mu.Unlock()
+		if panicValue != nil && tq.onPanic != nil {
+			go callPanicHandler(tq.onPanic, panicValue)
+		}
 	}()
 	task()
+}
+
+func callPanicHandler(handler func(interface{}), panicValue interface{}) {
+	defer func() { _ = recover() }()
+	handler(panicValue)
 }
 
 func (tq *TaskQueue) workerStopped() {

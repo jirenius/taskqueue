@@ -162,6 +162,42 @@ func TestTaskQueuePanicDoesNotStrandLaterTasks(t *testing.T) {
 	receive(t, ran, "task after panic")
 }
 
+func TestTaskQueueOnPanicReceivesRecoveredPanic(t *testing.T) {
+	panics := make(chan interface{}, 1)
+	tq := NewTaskQueueWithOptions(2, TaskQueueOptions{
+		OnPanic: func(panicValue interface{}) { panics <- panicValue },
+	})
+	ran := make(chan struct{})
+	tq.Do(func() { panic("task failure") })
+	tq.Do(func() { close(ran) })
+	tq.Flush()
+	receive(t, ran, "task after panic")
+	select {
+	case got := <-panics:
+		if got != "task failure" {
+			t.Fatalf("OnPanic received %#v, want %#v", got, "task failure")
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for OnPanic")
+	}
+}
+
+func TestTaskQueueOnPanicHandlerCannotStopQueue(t *testing.T) {
+	handlerStarted := make(chan struct{})
+	tq := NewTaskQueueWithOptions(2, TaskQueueOptions{
+		OnPanic: func(interface{}) {
+			close(handlerStarted)
+			panic("handler failure")
+		},
+	})
+	ran := make(chan struct{})
+	tq.Do(func() { panic("task failure") })
+	tq.Do(func() { close(ran) })
+	tq.Flush()
+	receive(t, ran, "task after a panicking OnPanic handler")
+	receive(t, handlerStarted, "panicking OnPanic handler")
+}
+
 func TestTaskQueueReentrantPauseAndFlushUseNonBlockingVariants(t *testing.T) {
 	tq := NewTaskQueue(2)
 	requested := make(chan struct{})
