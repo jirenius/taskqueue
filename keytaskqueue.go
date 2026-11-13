@@ -4,6 +4,9 @@ import "sync"
 
 // KeyTaskQueue implements a queue for tasks to be handled sequentially in
 // a first-in-first-out order on separate goroutines identified by a key string.
+// Panics from tasks are recovered so that later work for the same key continues.
+// A task may call TryDo, but must not call Do if its key's waiting queue is
+// full, because it would block the only worker that can free capacity.
 type KeyTaskQueue struct {
 	mu    sync.Mutex
 	qpool sync.Pool
@@ -93,8 +96,13 @@ func (nq *KeyTaskQueue) addTask(q *taskQueue, task func()) {
 }
 
 func (nq *KeyTaskQueue) processQueue(key string, q *taskQueue) {
-	nq.mu.Lock()
-	for q.size > 0 {
+	defer nq.workerStopped(key, q)
+	for {
+		nq.mu.Lock()
+		if q.size == 0 {
+			nq.mu.Unlock()
+			return
+		}
 		// Get next task
 		task := q.q[q.offset]
 		q.q[q.offset] = nil // Prevent memory leaks
@@ -106,10 +114,25 @@ func (nq *KeyTaskQueue) processQueue(key string, q *taskQueue) {
 		q.size--
 		nq.mu.Unlock()
 		// Perform task
-		task()
-		nq.mu.Lock()
+		nq.invokeTask(task)
+	}
+}
+
+// invokeTask keeps a task panic from stranding later work for the same key.
+func (nq *KeyTaskQueue) invokeTask(task func()) {
+	defer func() { _ = recover() }()
+	task()
+}
+
+func (nq *KeyTaskQueue) workerStopped(key string, q *taskQueue) {
+	nq.mu.Lock()
+	defer nq.mu.Unlock()
+	if q.size > 0 {
+		// A producer can enqueue while the worker is shutting down; runtime.Goexit
+		// in a task reaches this path too. Continue the key's work in either case.
+		go nq.processQueue(key, q)
+		return
 	}
 	delete(nq.qs, key)
 	nq.qpool.Put(q)
-	nq.mu.Unlock()
 }

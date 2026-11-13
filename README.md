@@ -30,6 +30,18 @@ go get github.com/jirenius/taskqueue
     }
 ```
 
+`Flush` is a completion barrier: when it returns, no task is waiting and no
+task is running. `Pause` prevents additional tasks from starting and waits for
+an already-running task to finish; pauses are nested and require matching calls
+to `Resume`.
+
+Task panics are recovered so later queued tasks continue to execute. A callback
+may use `TryDo`, and may use `Do` only when it knows the waiting queue has room.
+Callbacks must not call `Pause` or `Flush`: either call waits for the callback
+itself to return and would therefore deadlock. Callbacks can instead use
+`RequestPause` and `FlushAsync` (without waiting for the returned channel before
+the callback returns).
+
 ### KeyTaskQueue
 ```go
     // Create a KeyTaskQueue with a queue cap of 5 per key.
@@ -47,3 +59,6 @@ go get github.com/jirenius/taskqueue
     }
 ```
 
+Keyed queues also recover task panics and continue the remaining work for that
+key. As with `TaskQueue`, a callback should use `TryDo` rather than call `Do`
+when its key's waiting queue might be full.
